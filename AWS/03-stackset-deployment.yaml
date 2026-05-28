@@ -1,0 +1,155 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Trend Micro Agent Service - StackSet definition (SERVICE_MANAGED).
+  Deploy this stack ONCE in the Org management account (or in a delegated
+  administrator account). It creates the CloudFormation StackSet that
+  propagates the member template to every account in the Organization,
+  with auto-deployment enabled for new accounts.
+
+# -----------------------------------------------------------------------------
+# Parameters
+# -----------------------------------------------------------------------------
+Parameters:
+
+  StackSetName:
+    Type: String
+    Description: 'Name of the StackSet to create'
+    Default: TrendMicroAgentService-OrgWide
+
+  MemberTemplateURL:
+    Type: String
+    Description: >
+      HTTPS S3 URL of the member template (02-member-stackset-template.yaml).
+      Upload the template to any S3 bucket accessible from the management
+      account and paste the URL here. Example:
+      https://my-cfn-templates.s3.amazonaws.com/trendmicro/02-member-stackset-template.yaml
+
+  CentralS3Bucket:
+    Type: String
+    Description: 'Name of the central scripts bucket (output of stack 01)'
+
+  CentralKMSKeyArn:
+    Type: String
+    Description: 'OPTIONAL. KMS Key ARN if the central bucket uses SSE-KMS. Leave empty for SSE-S3.'
+    Default: ''
+
+  EC2TagFilter:
+    Type: String
+    Description: "EC2 instance tag filter ('NONE' or 'key:value' or 'k1:v1;k2:v2')"
+    Default: 'NONE'
+
+  InstanceScope:
+    Type: String
+    Description: 'Scope of instances to process'
+    Default: ECS_EKS_ONLY
+    AllowedValues:
+      - ECS_EKS_ONLY
+      - ALL_INSTANCES
+
+  TargetOrganizationalUnitIds:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-separated list of OU IDs (or the Org Root ID, e.g., r-xxxx) to
+      target. The StackSet will deploy to ALL accounts under these OUs and
+      auto-deploy to new accounts that join them.
+
+  TargetRegions:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-separated list of regions to deploy into. Example:
+      us-east-1,eu-west-1
+
+  FailureTolerancePercentage:
+    Type: Number
+    Description: 'Percentage of accounts that can fail before the operation stops (0-100)'
+    Default: 10
+    MinValue: 0
+    MaxValue: 100
+
+  MaxConcurrentPercentage:
+    Type: Number
+    Description: 'Maximum percentage of accounts to deploy to concurrently (1-100)'
+    Default: 25
+    MinValue: 1
+    MaxValue: 100
+
+  LogRetentionDays:
+    Type: Number
+    Description: 'CloudWatch Logs retention period in days (passed to member stacks)'
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+# -----------------------------------------------------------------------------
+# Resources
+# -----------------------------------------------------------------------------
+Resources:
+
+  TrendMicroAgentStackSet:
+    Type: AWS::CloudFormation::StackSet
+    Properties:
+      StackSetName: !Ref StackSetName
+      Description: 'Trend Micro Agent Service - Org-wide deployment'
+
+      # Service-managed permissions => CFN manages the execution roles
+      # in member accounts automatically via AWS Organizations.
+      PermissionModel: SERVICE_MANAGED
+
+      # Allow auto-deployment when new accounts join the targeted OUs,
+      # and remove stacks if accounts are removed from those OUs.
+      AutoDeployment:
+        Enabled: true
+        RetainStacksOnAccountRemoval: false
+
+      # CAPABILITY_NAMED_IAM because the member template creates IAM roles
+      # with explicit names. (CAPABILITY_AUTO_EXPAND is not needed because
+      # the member template does not use macros/transforms.)
+      Capabilities:
+        - CAPABILITY_NAMED_IAM
+
+      # Member template hosted in S3 (must be readable from the management /
+      # delegated-admin account).
+      TemplateURL: !Ref MemberTemplateURL
+
+      # Parameters propagated to every member stack instance.
+      Parameters:
+        - ParameterKey: S3Bucket
+          ParameterValue: !Ref CentralS3Bucket
+        - ParameterKey: KMSKeyArn
+          ParameterValue: !Ref CentralKMSKeyArn
+        - ParameterKey: Tag
+          ParameterValue: !Ref EC2TagFilter
+        - ParameterKey: InstanceScope
+          ParameterValue: !Ref InstanceScope
+        - ParameterKey: LogRetentionDays
+          ParameterValue: !Ref LogRetentionDays
+
+      # Where to deploy.
+      StackInstancesGroup:
+        - DeploymentTargets:
+            OrganizationalUnitIds: !Ref TargetOrganizationalUnitIds
+          Regions: !Ref TargetRegions
+
+      OperationPreferences:
+        FailureTolerancePercentage: !Ref FailureTolerancePercentage
+        MaxConcurrentPercentage: !Ref MaxConcurrentPercentage
+        RegionConcurrencyType: PARALLEL
+
+      Tags:
+        - Key: Application
+          Value: TrendMicroAgentService
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Scope
+          Value: Organization
+
+# -----------------------------------------------------------------------------
+# Outputs
+# -----------------------------------------------------------------------------
+Outputs:
+  StackSetId:
+    Description: 'ID of the created StackSet'
+    Value: !Ref TrendMicroAgentStackSet
+
+  StackSetConsoleURL:
+    Description: 'Console URL to monitor the StackSet'
+    Value: !Sub 'https://console.aws.amazon.com/cloudformation/home?region=${AWS::Region}#/stacksets/${StackSetName}'

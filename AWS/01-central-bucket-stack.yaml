@@ -1,0 +1,185 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Trend Micro Agent Service - Central S3 bucket for installation scripts.
+  Deploy this stack ONCE in the shared-services account (or the Org management
+  account if no shared-services account exists). All member accounts of the
+  AWS Organization will read installation scripts from this bucket via
+  cross-account permissions scoped by aws:PrincipalOrgID.
+
+# -----------------------------------------------------------------------------
+# Parameters
+# -----------------------------------------------------------------------------
+Parameters:
+
+  OrganizationId:
+    Type: String
+    Description: >
+      AWS Organizations ID used to scope cross-account access (format: o-xxxxxxxxxx).
+      Find it with: aws organizations describe-organization --query 'Organization.Id'
+    AllowedPattern: '^o-[a-z0-9]{10,32}$'
+    ConstraintDescription: Must be a valid Organization ID (e.g., o-abcdef1234)
+
+  BucketName:
+    Type: String
+    Description: >
+      Globally unique S3 bucket name. Convention recommended:
+      trendmicro-agent-scripts-<org-short-name>-<aws-region>
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: Must follow S3 bucket naming rules.
+
+  EnableKMSEncryption:
+    Type: String
+    Description: >
+      Set to 'true' to encrypt the bucket with a customer-managed KMS CMK
+      (recommended for sensitive payloads). Set to 'false' to use SSE-S3 (AES256).
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+# -----------------------------------------------------------------------------
+# Conditions
+# -----------------------------------------------------------------------------
+Conditions:
+  UseKMS: !Equals [!Ref EnableKMSEncryption, 'true']
+
+# -----------------------------------------------------------------------------
+# Resources
+# -----------------------------------------------------------------------------
+Resources:
+
+  # ---------- KMS Customer-Managed Key (optional) ----------
+  CentralScriptsKMSKey:
+    Type: AWS::KMS::Key
+    Condition: UseKMS
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: 'CMK encrypting Trend Micro agent installation scripts (cross-account read by Org)'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowOrgAccountsDecrypt
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:PrincipalOrgID': !Ref OrganizationId
+      Tags:
+        - Key: Application
+          Value: TrendMicroAgentService
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  CentralScriptsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: UseKMS
+    Properties:
+      AliasName: alias/trendmicro-agent-scripts
+      TargetKeyId: !Ref CentralScriptsKMSKey
+
+  # ---------- S3 Bucket ----------
+  CentralScriptsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - !If
+            - UseKMS
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: aws:kms
+                KMSMasterKeyID: !GetAtt CentralScriptsKMSKey.Arn
+              BucketKeyEnabled: true
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+      Tags:
+        - Key: Application
+          Value: TrendMicroAgentService
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------- Bucket Policy ----------
+  CentralScriptsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CentralScriptsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+
+          # Allow read access from any account in the Organization
+          - Sid: AllowOrgAccountsRead
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:ListBucket
+            Resource:
+              - !GetAtt CentralScriptsBucket.Arn
+              - !Sub '${CentralScriptsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'aws:PrincipalOrgID': !Ref OrganizationId
+
+          # Hard deny for non-TLS traffic
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CentralScriptsBucket.Arn
+              - !Sub '${CentralScriptsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+# -----------------------------------------------------------------------------
+# Outputs
+# -----------------------------------------------------------------------------
+Outputs:
+
+  CentralBucketName:
+    Description: 'Pass this value as the S3Bucket parameter to the member StackSet template'
+    Value: !Ref CentralScriptsBucket
+    Export:
+      Name: TrendMicroAgentService-CentralBucketName
+
+  CentralBucketArn:
+    Description: 'ARN of the central scripts bucket'
+    Value: !GetAtt CentralScriptsBucket.Arn
+
+  CentralKMSKeyArn:
+    Description: 'KMS Key ARN (only if KMS encryption was enabled). Pass this as KMSKeyArn parameter to the member StackSet.'
+    Condition: UseKMS
+    Value: !GetAtt CentralScriptsKMSKey.Arn
